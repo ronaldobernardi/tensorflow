@@ -1,15 +1,14 @@
 # Description:
 #   Doc generator
 
-licenses(["notice"])  # Apache 2.0
-
-exports_files(["LICENSE"])
+load("//tensorflow:tensorflow.bzl", "py_test")
 
 package(
     default_visibility = ["//tensorflow:__subpackages__"],
+    licenses = ["notice"],  # Apache 2.0
 )
 
-load("//tensorflow:tensorflow.bzl", "py_test")
+exports_files(["LICENSE"])
 
 py_library(
     name = "doc_generator_visitor",
@@ -150,6 +149,7 @@ py_test(
 
 py_test(
     name = "generate2_test",
+    size = "medium",
     srcs = ["generate2_test.py"],
     python_version = "PY2",
     srcs_version = "PY2AND3",

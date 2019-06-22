@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "absl/memory/memory.h"
 #include "absl/types/variant.h"
+#include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/tf2xla/graph_compiler.h"
 #include "tensorflow/compiler/tf2xla/rearrange_function_argument.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
@@ -518,11 +519,12 @@ Status XlaCompiler::FindFunctionBody(const NameAttrList& function,
 std::unique_ptr<Graph> XlaCompiler::GetGraph(const FunctionBody* fbody) {
   std::unique_ptr<Graph> graph(new Graph(options_.flib_def));
   CopyGraph(*fbody->graph, graph.get());
+  auto flags = GetBuildXlaOpsPassFlags();
   OptimizerOptions opts;
   opts.set_opt_level(OptimizerOptions::L0);
   opts.set_do_common_subexpression_elimination(false);
   opts.set_do_function_inlining(true);
-  opts.set_do_constant_folding(true);
+  opts.set_do_constant_folding(!flags->tf_xla_disable_constant_folding);
   GraphOptimizer optimizer(opts);
   // Do not constant fold nodes that output DT_VARIANT type tensors.
   // XLA does not support Const nodes of Variant type since it needs
@@ -551,6 +553,7 @@ std::unique_ptr<Graph> XlaCompiler::GetGraph(const FunctionBody* fbody) {
   GraphOptimizer::Options graph_optimizer_options;
   graph_optimizer_options.cf_consider_fn = cf_consider_fn;
   graph_optimizer_options.inline_multi_device_functions = true;
+  graph_optimizer_options.inline_impl_selection_group_functions = true;
   optimizer.Optimize(flib_runtime_, flib_runtime_->env(),
                      /*device=*/nullptr, &graph, graph_optimizer_options);
 

@@ -49,6 +49,15 @@ limitations under the License.
 namespace tensorflow {
 namespace {
 
+class XrtClientSession : public ClientSession {
+ public:
+  explicit XrtClientSession(const Scope& scope) : ClientSession(scope) {
+    auto clear_all = ops::XRTReleaseAllAllocations(scope);
+    std::vector<Tensor> outputs;
+    TF_CHECK_OK(Run(ClientSession::FeedType(), {}, {clear_all}, &outputs));
+  }
+};
+
 string* xla_test_device_ptr;  // initial value set in main()
 string* xla_platform_ptr;     // initial value set in main()
 
@@ -301,7 +310,7 @@ TEST(RawApiTest, AllocFromTensor) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -309,6 +318,72 @@ TEST(RawApiTest, AllocFromTensor) {
   xla::LiteralProto response;
   EXPECT_TRUE(response.ParseFromString(outputs[0].scalar<string>()()));
   EXPECT_TRUE(CompareLiteralToLiteralProto(literal, response));
+}
+
+TEST(RawApiTest, AllocUninitialized) {
+  xla::Literal literal =
+      xla::LiteralUtil::CreateR2<float>({{4.0f, 5.0f}, {6.0f, 7.0f}});
+  Tensor tensor;
+  TF_ASSERT_OK(LiteralToHostTensor(literal, DT_FLOAT, &tensor));
+
+  Scope root = Scope::NewRootScope().WithDevice(DeviceFromFlag());
+  std::vector<int> layout =
+      GetAttrLayout(literal.shape().layout().minor_to_major());
+
+  auto allocate_op =
+      ops::XRTAllocateUninitialized(root, DT_FLOAT, tensor.shape());
+
+  Tensor handle;
+  std::vector<Tensor> outputs;
+  XrtClientSession session(root);
+  // Allocate the tensor
+  {
+    TF_EXPECT_OK(session.Run({allocate_op}, &outputs));
+    handle = outputs[0];
+  }
+
+  // Make sure it has the expected shape
+  {
+    auto read_back_op = ops::XRTReadLiteral(root, handle);
+    TF_ASSERT_OK(root.status());
+
+    TF_EXPECT_OK(session.Run({read_back_op}, &outputs));
+    EXPECT_EQ(outputs.size(), 1);
+    xla::LiteralProto read_back_literal;
+    EXPECT_TRUE(
+        read_back_literal.ParseFromString(outputs[0].scalar<string>()()));
+    Tensor read_back_tensor;
+    TF_ASSERT_OK(LiteralToHostTensor(
+        xla::Literal::CreateFromProto(read_back_literal).ValueOrDie(), DT_FLOAT,
+        &read_back_tensor));
+
+    // The shape should be the same as 'tensor', but we don't have any
+    // expectation about the value of the tensors yet since it is uninitialized
+    EXPECT_EQ(tensor.shape(), read_back_tensor.shape());
+  }
+
+  // Make sure we can write to it
+  xla::LiteralProto new_literal =
+      xla::LiteralUtil::CreateR2({{9.0f, 2.0f}, {4.0f, 1.0f}}).ToProto();
+  {
+    auto new_value = ops::Const(root.WithDevice("/device:CPU:0"),
+                                new_literal.SerializeAsString());
+    auto write_op = ops::XRTWriteLiteral(root, Input(handle), new_value);
+    TF_ASSERT_OK(root.status());
+    TF_EXPECT_OK(session.Run({write_op}, &outputs));
+  }
+
+  // Now read it back
+  {
+    auto read_back_op = ops::XRTReadLiteralAndRelease(root, handle);
+    TF_ASSERT_OK(root.status());
+    TF_EXPECT_OK(session.Run({read_back_op}, &outputs));
+    EXPECT_EQ(outputs.size(), 1);
+
+    xla::LiteralProto response;
+    EXPECT_TRUE(response.ParseFromString(outputs[0].scalar<string>()()));
+    EXPECT_TRUE(CompareLiteralProtos(response, new_literal));
+  }
 }
 
 TEST(RawApiTest, AllocFromTensorTuple) {
@@ -332,7 +407,7 @@ TEST(RawApiTest, AllocFromTensorTuple) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -358,7 +433,7 @@ TEST(RawApiTest, AllocFromTensorTupleSingle) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -384,7 +459,7 @@ TEST(RawApiTest, AllocFromTensorRelayout) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -411,7 +486,7 @@ TEST(RawApiTest, AllocAndRewrite) {
   auto read_back = ops::XRTReadLiteral(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back, handle}, &outputs));
   EXPECT_EQ(outputs.size(), 2);
@@ -464,7 +539,7 @@ TEST(RawApiTest, AllocReleaseMany) {
   auto handle2 = ops::XRTAllocate(root, value2);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({handle1, handle2}, &outputs));
   EXPECT_EQ(outputs.size(), 2);
@@ -513,7 +588,7 @@ TEST(RawApiTest, CompileAndReleaseMany) {
   auto c_handle2 = ops::XRTCompile(root, computation2);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({c_handle1.handle, c_handle2.handle}, &outputs));
   EXPECT_EQ(outputs.size(), 2);
@@ -540,7 +615,7 @@ TEST(RawApiTest, AllocAndClearAll) {
   auto handle = ops::XRTAllocate(root, value);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({handle}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -571,7 +646,7 @@ TEST(RawApiTest, ReadAndWriteState) {
       root.WithControlDependencies(read_back), handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(
       session.Run(ClientSession::FeedType(), {read_back}, {release}, &outputs));
@@ -593,7 +668,7 @@ TEST(RawApiTest, ReadAndWriteStateAutoFree) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
 
@@ -624,7 +699,7 @@ TEST(RawApiTest, SubBuffer) {
   auto value_00 = ops::XRTReadLiteralAndRelease(root, sub_00);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({value_0, value_1, value_00}, &outputs));
 
@@ -700,7 +775,7 @@ TEST(RawApiTest, MakeTuple) {
   auto res_1 = ops::XRTReadLiteralAndRelease(root, handle_4);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({res_0, res_1}, &outputs));
   xla::LiteralProto response_0;
@@ -740,7 +815,7 @@ TEST(RawApiTest, ExecuteChainedOpByOp) {
       root, ops::Const(root.WithDevice("/device:CPU:0"), c_sub_scale));
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(
       session.Run({c_add_scale_op.handle, c_sub_scale_op.handle}, &outputs));
@@ -810,7 +885,7 @@ TEST(RawApiTest, ExecuteChained) {
       root, ops::Const(root.WithDevice("/device:CPU:0"), c_sub_scale));
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(
       session.Run({c_add_scale_op.handle, c_sub_scale_op.handle}, &outputs));
@@ -942,7 +1017,7 @@ TEST(RawApiTest, CompileAndExecute) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back, c_handle.program_shape}, &outputs));
 
@@ -997,7 +1072,7 @@ TEST(RawApiTest, CompileAndExecuteWithArgumentVector) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back, c_handle.program_shape}, &outputs));
 
@@ -1047,7 +1122,7 @@ TEST(RawApiTest, CompileWithXlaReturnShapes) {
   auto release = ops::XRTReleaseCompilationHandle(root, c_handle.handle);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run(ClientSession::FeedType(), {c_handle.program_shape},
                            {release}, &outputs));
@@ -1116,7 +1191,7 @@ TEST(RawApiTest, DotGeneralWithLayoutTest) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
 
@@ -1151,7 +1226,7 @@ TEST(RawApiTest, CompileAndExecuteZeroArg) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
 
@@ -1201,7 +1276,7 @@ TEST(RawApiTest, CompileAndExecuteReturnTuple) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back}, &outputs));
 
@@ -1252,7 +1327,7 @@ TEST(RawApiTest, CompileAndExecuteReturnExplodedTuple) {
                                 {Output(p0_handle), Output(p1_handle)});
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({result}, &outputs));
   EXPECT_EQ(outputs.size(), 1);
@@ -1294,7 +1369,7 @@ TEST(RawApiTest, LeakCompilationReference) {
   auto c_handle = ops::XRTCompile(root, computation);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({c_handle.handle}, &outputs));
 }
@@ -1338,7 +1413,7 @@ TEST(RawApiTest, CompileAndExecuteWithReusedBuffers) {
   e.set_release_compilation_handle(true);
 
   Scope root = Scope::NewRootScope().WithDevice(DeviceFromFlag());
-  ClientSession session(root);
+  XrtClientSession session(root);
   auto e_config =
       ops::Const(root.WithDevice("/device:CPU:0"), e.SerializeAsString());
   auto c_data =
@@ -1434,7 +1509,7 @@ TEST(RawApiTest, CompileAndExecuteWithS64Argument) {
   auto read_back = ops::XRTReadLiteralAndRelease(root, result);
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run({read_back, c_handle.program_shape}, &outputs));
 
@@ -1466,7 +1541,7 @@ TEST(RawApiTest, TestDeviceMemoryCompaction) {
   }
   TF_ASSERT_OK(root.status());
 
-  ClientSession session(root);
+  XrtClientSession session(root);
   std::vector<Tensor> outputs;
   TF_EXPECT_OK(session.Run(handle_outputs, &outputs));
   EXPECT_EQ(outputs.size(), handle_outputs.size());
@@ -1553,7 +1628,7 @@ TEST(RawApiTest, TestDeviceMemorySwap) {
   e.set_release_compilation_handle(false);
 
   Scope root = Scope::NewRootScope().WithDevice(DeviceFromFlag());
-  ClientSession session(root);
+  XrtClientSession session(root);
   auto e_config =
       ops::Const(root.WithDevice("/device:CPU:0"), e.SerializeAsString());
   auto bcast_computation =
@@ -1574,7 +1649,7 @@ TEST(RawApiTest, TestDeviceMemorySwap) {
     auto result = ops::XRTExecute(root, c_bcast_handle.handle, e_config,
                                   {Output(p0_handle)});
     TF_ASSERT_OK(root.status());
-    TF_EXPECT_OK(session.Run({result}, &outputs));
+    TF_ASSERT_OK(session.Run({result}, &outputs));
     EXPECT_EQ(outputs.size(), 1);
     device_handles.push_back(outputs[0].scalar<int64>()());
   }
@@ -1589,7 +1664,7 @@ TEST(RawApiTest, TestDeviceMemorySwap) {
     auto read_back = ops::XRTReadLiteral(root, exec_op);
 
     TF_ASSERT_OK(root.status());
-    TF_EXPECT_OK(session.Run({read_back}, &outputs));
+    TF_ASSERT_OK(session.Run({read_back}, &outputs));
     EXPECT_EQ(outputs.size(), 1);
 
     xla::LiteralProto response;
